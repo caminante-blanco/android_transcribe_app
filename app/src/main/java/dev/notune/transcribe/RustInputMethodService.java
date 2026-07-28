@@ -454,8 +454,25 @@ public class RustInputMethodService extends InputMethodService {
     }
 
     // Called from Rust
+    public void onPartialTextTranscribed(String text) {
+        mainHandler.post(() -> {
+            if (text == null) return;
+            InputConnection ic = getCurrentInputConnection();
+            if (inputActive && ic != null) {
+                ic.setComposingText(text, 1);
+            }
+        });
+    }
+
+    // Called from Rust
     public void onTextTranscribed(String text) {
         mainHandler.post(() -> {
+            InputConnection ic = getCurrentInputConnection();
+            if (ic != null) {
+                ic.setComposingText("", 1);
+                ic.finishComposingText();
+            }
+
             if (text == null || text.trim().isEmpty()) {
                 // Nothing recognized — don't insert a stray space.
                 updateRecordButtonUI(false);
@@ -471,7 +488,6 @@ public class RustInputMethodService extends InputMethodService {
                 return;
             }
             String committed = text + " ";
-            InputConnection ic = getCurrentInputConnection();
             if (inputActive && ic != null) {
                 commitTranscribedText(ic, committed);
             } else {

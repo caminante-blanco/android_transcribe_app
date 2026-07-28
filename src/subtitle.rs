@@ -94,6 +94,8 @@ struct LiveSubtitleState {
     /// smoothed by the worker; 0 until the first job completes. Used to
     /// predict a partial's cost before submitting it.
     rtf_milli: Arc<AtomicU32>,
+    /// Whether the loaded model supports streaming.
+    use_streaming: bool,
 }
 
 static LIVE_STATE: Lazy<Mutex<Option<LiveSubtitleState>>> = Lazy::new(|| Mutex::new(None));
@@ -122,6 +124,13 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_LiveSubtitleService_ini
     let pending_finals = Arc::new(AtomicUsize::new(0));
     let rtf_milli = Arc::new(AtomicU32::new(0));
 
+    let use_streaming = if let Some(engine_arc) = engine::get_engine() {
+        let guard = engine_arc.lock().unwrap_or_else(|p| p.into_inner());
+        guard.supports_streaming()
+    } else {
+        false
+    };
+
     *LIVE_STATE.lock().unwrap() = Some(LiveSubtitleState {
         segment: Vec::new(),
         preroll: Vec::new(),
@@ -133,6 +142,7 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_LiveSubtitleService_ini
         total_pushed: total_pushed.clone(),
         pending_finals: pending_finals.clone(),
         rtf_milli: rtf_milli.clone(),
+        use_streaming,
     });
 
     std::thread::spawn(move || {
@@ -158,6 +168,40 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_LiveSubtitleService_ini
                 );
             }
         };
+
+        if use_streaming {
+            if let Some(engine_arc) = engine::get_engine() {
+                let mut engine_guard = engine_arc.lock().unwrap_or_else(|p| p.into_inner());
+                let run_opts = transcribe_cpp::RunOptions {
+                    language: engine_guard.language(),
+                    task: engine_guard.task(),
+                    ..Default::default()
+                };
+                let stream_opts = transcribe_cpp::StreamOptions {
+                    commit_policy: transcribe_cpp::CommitPolicy::Auto,
+                    ..Default::default()
+                };
+                let session = engine_guard.session_mut();
+                let stream_res = session.stream(&run_opts, &stream_opts);
+                if let Ok(mut stream) = stream_res {
+                    log::info!("Live subtitles (streaming mode): started");
+                    while let Ok(job) = rx.recv() {
+                        if let Ok(update) = stream.feed(&job.samples) {
+                            if update.committed_changed || update.tentative_changed {
+                                let text = stream.text();
+                                deliver(&mut env, &text.display(), false);
+                            }
+                        }
+                    }
+                    log::info!("Live subtitles (streaming mode): rx closed, finalizing stream");
+                    if let Ok(_update) = stream.finalize() {
+                        let text = stream.text();
+                        deliver(&mut env, &text.display(), true);
+                    }
+                    return;
+                }
+            }
+        }
 
         while let Ok(job) = rx.recv() {
             let mut job = job;
@@ -273,6 +317,29 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_LiveSubtitleService_pus
     }
     let mut input = vec![0.0f32; len];
     if env.get_float_array_region(&data, 0, &mut input).is_err() {
+        return;
+    }
+
+    let use_streaming = {
+        let mut guard = LIVE_STATE.lock().unwrap();
+        match guard.as_mut() {
+            Some(s) => s.use_streaming,
+            None => false,
+        }
+    };
+
+    if use_streaming {
+        let mut guard = LIVE_STATE.lock().unwrap();
+        let state = match guard.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let stream_pos = state.total_pushed.fetch_add(len as u64, Ordering::SeqCst) + len as u64;
+        let _ = state.worker_tx.send(Job {
+            samples: input,
+            is_final: false,
+            end_sample: stream_pos,
+        });
         return;
     }
 

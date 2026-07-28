@@ -53,6 +53,22 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn supports_streaming(&self) -> bool {
+        self.session.model().capabilities().supports_streaming
+    }
+
+    pub fn session_mut(&mut self) -> &mut transcribe_cpp::Session {
+        &mut self.session
+    }
+
+    pub fn language(&self) -> Option<String> {
+        self.language.clone()
+    }
+
+    pub fn task(&self) -> transcribe_cpp::Task {
+        self.task
+    }
+
     fn load(
         model_path: &Path,
         language: Option<String>,

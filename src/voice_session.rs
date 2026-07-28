@@ -30,6 +30,11 @@ struct Endpointing {
     speech_started: AtomicBool,
 }
 
+pub enum StreamMsg {
+    Audio(Vec<f32>),
+    Cancel,
+}
+
 pub struct VoiceSessionState {
     pub stream: Option<SendStream>,
     pub audio_buffer: Arc<Mutex<Vec<f32>>>,
@@ -39,6 +44,8 @@ pub struct VoiceSessionState {
     /// True while the current recording runs; flipped off on stop/cancel so
     /// the auto-stop monitor (if any) exits.
     pub session_active: Arc<AtomicBool>,
+    pub stream_tx: Option<crossbeam_channel::Sender<StreamMsg>>,
+    pub use_streaming: Arc<AtomicBool>,
 }
 
 fn notify_status(env: &mut JNIEnv, obj: &JObject, msg: &str) {
@@ -48,6 +55,17 @@ fn notify_status(env: &mut JNIEnv, obj: &JObject, msg: &str) {
             "onStatusUpdate",
             "(Ljava/lang/String;)V",
             &[(&jmsg).into()],
+        );
+    }
+}
+
+fn notify_partial_text(env: &mut JNIEnv, obj: &JObject, text: &str) {
+    if let Ok(jtxt) = env.new_string(text) {
+        let _ = env.call_method(
+            obj,
+            "onPartialTextTranscribed",
+            "(Ljava/lang/String;)V",
+            &[(&jtxt).into()],
         );
     }
 }
@@ -83,6 +101,8 @@ pub fn init_session(env: JNIEnv, target: JObject) -> VoiceSessionState {
         target_ref: target_ref.clone(),
         last_level_sent: Arc::new(Mutex::new(std::time::Instant::now())),
         session_active: Arc::new(AtomicBool::new(false)),
+        stream_tx: None,
+        use_streaming: Arc::new(AtomicBool::new(false)),
     };
 
     // Load engine in background
@@ -123,6 +143,82 @@ pub fn start_recording(mut env: JNIEnv, state: &mut VoiceSessionState, auto_stop
     state.audio_buffer.lock().unwrap().clear();
     let buffer_clone = state.audio_buffer.clone();
 
+    // Create streaming channel
+    let (tx, rx) = crossbeam_channel::unbounded::<StreamMsg>();
+    state.stream_tx = Some(tx);
+
+    let jvm_stream = state.jvm.clone();
+    let target_ref_stream = state.target_ref.clone();
+    let use_streaming_atomic = state.use_streaming.clone();
+
+    // Reset before we start a new session
+    use_streaming_atomic.store(false, Ordering::SeqCst);
+
+    std::thread::spawn(move || {
+        let mut env = match jvm_stream.attach_current_thread() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let obj = target_ref_stream.as_obj();
+
+        // Wait for engine if somehow still loading
+        if engine::get_engine().is_none() {
+            if let Err(_) = engine::ensure_loaded(&mut env, obj) {
+                return;
+            }
+        }
+
+        let use_streaming = if let Some(engine_arc) = engine::get_engine() {
+            let guard = engine_arc.lock().unwrap_or_else(|p| p.into_inner());
+            guard.supports_streaming()
+        } else {
+            false
+        };
+        use_streaming_atomic.store(use_streaming, Ordering::SeqCst);
+
+        if use_streaming {
+            if let Some(engine_arc) = engine::get_engine() {
+                let mut engine_guard = engine_arc.lock().unwrap_or_else(|p| p.into_inner());
+                let run_opts = transcribe_cpp::RunOptions {
+                    language: engine_guard.language(),
+                    task: engine_guard.task(),
+                    ..Default::default()
+                };
+                let stream_opts = transcribe_cpp::StreamOptions {
+                    commit_policy: transcribe_cpp::CommitPolicy::Auto,
+                    ..Default::default()
+                };
+                let session = engine_guard.session_mut();
+                let stream_res = session.stream(&run_opts, &stream_opts);
+                if let Ok(mut stream) = stream_res {
+                    log::info!("Voice session streaming: started");
+                    while let Ok(msg) = rx.recv() {
+                        match msg {
+                            StreamMsg::Audio(samples) => {
+                                if let Ok(update) = stream.feed(&samples) {
+                                    if update.committed_changed || update.tentative_changed {
+                                        let text = stream.text();
+                                        notify_partial_text(&mut env, obj, &text.display());
+                                    }
+                                }
+                            }
+                            StreamMsg::Cancel => {
+                                log::info!("Voice session streaming: canceled");
+                                return;
+                            }
+                        }
+                    }
+                    log::info!("Voice session streaming: finalizing");
+                    if let Ok(_update) = stream.finalize() {
+                        let text = stream.text();
+                        notify_status(&mut env, obj, "Ready");
+                        notify_text(&mut env, obj, &text.display());
+                    }
+                }
+            }
+        }
+    });
+
     // End any previous session's monitor, then arm a fresh flag.
     state.session_active.store(false, Ordering::SeqCst);
     let session_active = Arc::new(AtomicBool::new(true));
@@ -142,11 +238,16 @@ pub fn start_recording(mut env: JNIEnv, state: &mut VoiceSessionState, auto_stop
     let target_ref = state.target_ref.clone();
     let last_sent = state.last_level_sent.clone();
     let endpoint_cb = endpoint.clone();
+    let stream_tx_cb = state.stream_tx.clone();
 
     let stream = device.build_input_stream(
         &config,
         move |data: &[f32], _: &_| {
             buffer_clone.lock().unwrap().extend_from_slice(data);
+
+            if let Some(tx) = &stream_tx_cb {
+                let _ = tx.send(StreamMsg::Audio(data.to_vec()));
+            }
 
             // compute RMS
             let mut sum = 0.0f32;
@@ -239,6 +340,15 @@ pub fn stop_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
     state.session_active.store(false, Ordering::SeqCst);
     state.stream = None;
 
+    let stream_tx = state.stream_tx.take();
+    drop(stream_tx);
+
+    let use_streaming = state.use_streaming.load(Ordering::SeqCst);
+
+    if use_streaming {
+        return;
+    }
+
     let buffer = state.audio_buffer.lock().unwrap().clone();
 
     // Guard against empty buffer (mic permission denied, instant stop, etc.)
@@ -290,5 +400,10 @@ pub fn cancel_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
     state.session_active.store(false, Ordering::SeqCst);
     state.stream = None;
     state.audio_buffer.lock().unwrap().clear();
+
+    if let Some(tx) = state.stream_tx.take() {
+        let _ = tx.send(StreamMsg::Cancel);
+    }
+
     notify_status(&mut env, state.target_ref.as_obj(), "Canceled");
 }

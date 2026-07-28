@@ -148,6 +148,14 @@ public class RecognizeActivity extends AppCompatActivity {
         runOnUiThread(() -> micLevel.setLevel(level));
     }
 
+    // Called from Rust
+    public void onPartialTextTranscribed(String text) {
+        runOnUiThread(() -> {
+            if (text == null || text.trim().isEmpty()) return;
+            status.setText(text);
+        });
+    }
+
     // Called from Rust – keep same method name as IME for code reuse
     public void onTextTranscribed(String text) {
         runOnUiThread(() -> {
